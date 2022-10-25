@@ -70,6 +70,7 @@ struct conf_load {
 	uint8_t			max_hashtable_bits;
 	uint16_t		kabi_prefix_len;
 	const char		*kabi_prefix;
+	const char		*header_guards_db_file;
 	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
 	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);

@@ -156,7 +156,7 @@ void strlist__remove(struct strlist *slist, struct str_node *sn)
 	str_node__delete(sn, slist->dupstr);
 }
 
-bool strlist__has_entry(struct strlist *slist, const char *entry)
+bool __strlist__has_entry(struct strlist *slist, const char *entry, void **priv)
 {
         struct rb_node **p = &slist->entries.rb_node;
         struct rb_node *parent = NULL;
@@ -173,11 +173,19 @@ bool strlist__has_entry(struct strlist *slist, const char *entry)
                         p = &(*p)->rb_left;
                 else if (rc < 0)
                         p = &(*p)->rb_right;
-		else
+		else {
+			if (priv)
+				*priv = sn->priv;
 			return true;
+		}
         }
 
 	return false;
+}
+
+bool strlist__has_entry(struct strlist *slist, const char *entry)
+{
+	return __strlist__has_entry(slist, entry, NULL);
 }
 
 Elf_Scn *elf_section_by_name(Elf *elf, GElf_Shdr *shp, const char *name, size_t *index)

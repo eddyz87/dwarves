@@ -299,6 +299,7 @@ int strlist__add(struct strlist *slist, const char *str);
 int __strlist__add(struct strlist *slist, const char *str, void *priv);
 
 bool strlist__has_entry(struct strlist *slist, const char *entry);
+bool __strlist__has_entry(struct strlist *slist, const char *entry, void **priv);
 
 static inline bool strlist__empty(const struct strlist *slist)
 {

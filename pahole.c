@@ -80,6 +80,7 @@ static int show_reorg_steps;
 static const char *class_name;
 static LIST_HEAD(class_names);
 static char separator = '\t';
+static struct strlist *header_guards_db = NULL;
 
 static bool compilable;
 static struct type_emissions emissions;
@@ -1222,6 +1223,7 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_languages_exclude	   336
 #define ARGP_skip_encoding_btf_enum64 337
 #define ARGP_skip_emitting_atomic_typedefs 338
+#define ARGP_header_guards_db	   339
 
 static const struct argp_option pahole__options[] = {
 	{
@@ -1635,6 +1637,17 @@ static const struct argp_option pahole__options[] = {
 		.doc  = "Do not emit 'typedef _Atomic int atomic_int' & friends."
 	},
 	{
+		.name = "header_guards_db",
+		.key  = ARGP_header_guards_db,
+		.arg  = "FILE",
+		.doc  = "Mapping between header file names and header guard strings. " \
+		        "Each file line constitutes a single record, record format is: " \
+		        "'<file-name-string> <guard-string>'. " \
+		        "Neither string should contain spaces. File names should match the names " \
+		        "as encoded in DWARF. E.g. for kernel build the file names " \
+		        " are relative to kernel source root."
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -1803,6 +1816,9 @@ static error_t pahole__options_parser(int key, char *arg,
 		conf_load.skip_encoding_btf_enum64 = true;	break;
 	case ARGP_skip_emitting_atomic_typedefs:
 		conf.skip_emitting_atomic_typedefs = true;	break;
+	case ARGP_header_guards_db:
+		conf_load.extra_dbg_info = true;
+		conf_load.header_guards_db_file = arg;	break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -3038,7 +3054,8 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			 * create it.
 			 */
 			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf, skip_encoding_btf_vars,
-						       btf_encode_force, btf_gen_floats, global_verbose);
+						       btf_encode_force, btf_gen_floats, global_verbose,
+						       header_guards_db);
 			if (btf_encoder && thr_data) {
 				struct thread_data *thread = thr_data;
 
@@ -3070,7 +3087,8 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 							 skip_encoding_btf_vars,
 							 btf_encode_force,
 							 btf_gen_floats,
-							 global_verbose);
+							 global_verbose,
+							 header_guards_db);
 				thread->btf = btf_encoder__btf(thread->encoder);
 			}
 			encoder = thread->encoder;
@@ -3382,6 +3400,73 @@ out_free:
 	return ret;
 }
 
+struct strlist *header_guards_db__new()
+{
+	return strlist__new(true);
+}
+
+/*
+ * Header guards db is a text file with one entry per line, each entry
+ * has the following form:
+ *   <header-file-name> <guard-name>
+ * It is assumed that neither <header-file-name> nor <guard-name> contain spaces.
+ * It is assumed that <header-file-name> is relative to kernel compilation tree.
+ */
+static int header_guards_db__load(struct strlist *header_guards_db, const char *filename)
+{
+	char entry[1024];
+	char header[1024];
+	char guard[1024];
+	char *true_header;
+	char *heap_guard;
+	int num_fields;
+	int err = -1;
+	int lineno = 1;
+	FILE *fp = fopen(filename, "r");
+
+	if (fp == NULL)
+		return -1;
+
+	while (fgets(entry, sizeof(entry), fp) != NULL) {
+		size_t len = strlen(entry);
+
+		if (len == 0)
+			continue;
+		entry[len - 1] = '\0';
+		num_fields = sscanf(entry, "%s %s", header, guard);
+		if (num_fields != 2) {
+			fprintf(stderr, "Error while reading header guards db:\n");
+			fprintf(stderr, "  can't match fields at line %d: %s\n", lineno, entry);
+			goto out;
+		}
+
+		heap_guard = strdup(guard);
+		if (!heap_guard)
+			goto out;
+
+		true_header = strstarts(header, "./") ? &header[2] : header;
+		if (__strlist__add(header_guards_db, true_header, heap_guard))
+			goto out;
+
+		++lineno;
+	}
+
+	err = 0;
+out:
+	fclose(fp);
+	return err;
+}
+
+#ifdef DEBUG_CHECK_LEAKS
+static void header_guards_db__free(struct strlist *header_guards_db)
+{
+	struct str_node *pos, *tmp;
+	strlist__for_each_entry_safe(header_guards_db, pos, tmp)
+		__zfree(&pos->priv);
+	strlist__delete(header_guards_db);
+}
+#endif
+
 int main(int argc, char *argv[])
 {
 	int err, remaining, rc = EXIT_FAILURE;
@@ -3407,6 +3492,18 @@ int main(int argc, char *argv[])
 	if (conf_load.hashtable_bits > 31) {
 		fprintf(stderr, "Invalid --hashbits value (%d) should be less than 32\n", conf_load.hashtable_bits);
 		goto out;
+	}
+
+ 	if (conf_load.header_guards_db_file) {
+		header_guards_db = header_guards_db__new();
+		if (!header_guards_db) {
+			fprintf(stderr, "pahole: insufficient memory\n");
+			goto out;
+		}
+		if (header_guards_db__load(header_guards_db, conf_load.header_guards_db_file)) {
+			fprintf(stderr, "Error while reading header guards db\n");
+			goto out;
+		}
 	}
 
 	if (dwarves__init()) {
@@ -3570,6 +3667,8 @@ out_dwarves_exit:
 out:
 #ifdef DEBUG_CHECK_LEAKS
 	prototypes__delete(&class_names);
+	if (header_guards_db)
+		header_guards_db__free(header_guards_db);
 #endif
 	return rc;
 }

@@ -22,6 +22,7 @@
 #include <inttypes.h>
 #include <limits.h>
 
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -75,6 +76,7 @@ struct btf_encoder {
 		int		    allocated;
 		int		    cnt;
 	} functions;
+	struct strlist *header_guards_db;
 };
 
 void btf_encoders__add(struct list_head *encoders, struct btf_encoder *encoder)
@@ -1408,7 +1410,8 @@ out:
 	return err;
 }
 
-struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool skip_encoding_vars, bool force, bool gen_floats, bool verbose)
+struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool skip_encoding_vars, bool force, bool gen_floats, bool verbose,
+				     struct strlist *header_guards_db)
 {
 	struct btf_encoder *encoder = zalloc(sizeof(*encoder));
 
@@ -1429,6 +1432,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		encoder->has_index_type  = false;
 		encoder->need_index_type = false;
 		encoder->array_index_id  = 0;
+		encoder->header_guards_db = header_guards_db;
 
 		GElf_Ehdr ehdr;
 
@@ -1505,6 +1509,67 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 	free(encoder);
 }
 
+#define DECL_FILE_HEADER_GUARD_TAG "header_guard:"
+
+/*
+ * For a given tag check if file name associated with it is present in
+ * header_guards_db. If present, emit a fake BTF_KIND_DECL_TAG record
+ * associated with this tag with a value of form "header_guard:<guard-name>".
+ */
+int btf_encoder__maybe_add_header_guard_tag(struct btf_encoder *encoder,
+					    struct tag *tag,
+					    struct cu *cu,
+					    int btf_type_id)
+{
+	const char *decl_file;
+	char *guard = NULL;
+	size_t guard_len;
+	char buf[256];
+
+	if (tag__type(tag)->declaration)
+		return 0;
+
+	decl_file = tag__decl_file(tag, cu);
+
+	if (!decl_file)
+		return 0;
+
+	if (strstarts(decl_file, "./"))
+		decl_file = &decl_file[2];
+
+	/* Ignore a possibility of an absolute path in the file name for now */
+
+	__strlist__has_entry(encoder->header_guards_db, decl_file, (void **)&guard);
+	if (!guard)
+		return 0;
+
+	guard_len = strlen(decl_file);
+	if (guard_len + strlen(DECL_FILE_HEADER_GUARD_TAG) + 1 > sizeof(buf)) {
+		fprintf(stderr, "error: uapi decl file name '%s' is too long (%lu)\n",
+			decl_file, guard_len);
+		return -1;
+	}
+	strcpy(buf, DECL_FILE_HEADER_GUARD_TAG);
+	strcpy(&buf[sizeof(DECL_FILE_HEADER_GUARD_TAG) - 1], guard);
+
+	return btf_encoder__add_decl_tag(encoder, buf, btf_type_id, -1);
+}
+
+static const char *dw_tag_printable_name(uint16_t tag) {
+	switch (tag) {
+	case DW_TAG_structure_type:
+		return "struct";
+	case DW_TAG_union_type:
+		return "union";
+	case DW_TAG_typedef:
+		return "typedef";
+	case DW_TAG_enumeration_type:
+		return "enum";
+	default:
+		return "<no_tag_name>";
+	}
+}
+
 int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct conf_load *conf_load)
 {
 	uint32_t type_id_off = btf__type_cnt(encoder->btf) - 1;
@@ -1556,17 +1621,11 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 
 	cu__for_each_type(cu, core_id, pos) {
 		struct namespace *ns;
-		const char *tag_name;
 
 		switch (pos->tag) {
 		case DW_TAG_structure_type:
-			tag_name = "struct";
-			break;
 		case DW_TAG_union_type:
-			tag_name = "union";
-			break;
 		case DW_TAG_typedef:
-			tag_name = "typedef";
 			break;
 		default:
 			continue;
@@ -1578,9 +1637,36 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 			tag_type_id = btf_encoder__add_decl_tag(encoder, annot->value, btf_type_id, annot->component_idx);
 			if (tag_type_id < 0) {
 				fprintf(stderr, "error: failed to encode tag '%s' to %s '%s' with component_idx %d\n",
-					annot->value, tag_name, namespace__name(ns), annot->component_idx);
+					annot->value, dw_tag_printable_name(pos->tag),
+					namespace__name(ns), annot->component_idx);
 				goto out;
 			}
+		}
+	}
+
+	cu__for_each_type(cu, core_id, pos) {
+		struct namespace *ns;
+
+		switch (pos->tag) {
+		case DW_TAG_structure_type:
+		case DW_TAG_union_type:
+		case DW_TAG_typedef:
+		case DW_TAG_enumeration_type:
+			break;
+		default:
+			continue;
+		}
+
+		btf_type_id = type_id_off + core_id;
+		tag_type_id = btf_encoder__maybe_add_header_guard_tag(encoder, pos,
+								      cu, btf_type_id);
+		if (tag_type_id < 0) {
+			ns = tag__namespace(pos);
+			fprintf(stderr,
+				"error: failed to encode uapi header info for %s tag '%s'\n",
+				dw_tag_printable_name(pos->tag),
+				namespace__name(ns));
+			goto out;
 		}
 	}
 
