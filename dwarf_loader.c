@@ -165,14 +165,19 @@ static struct dwarf_cu *dwarf_cu__new(struct cu *cu)
 	return dwarf_cu;
 }
 
+static void unspecified_type__delete(struct cu *cu, struct unspecified_type *utype);
+
 static void dwarf_cu__delete(struct cu *cu)
 {
 	if (cu == NULL || cu->priv == NULL)
 		return;
 
 	struct dwarf_cu *dcu = cu->priv;
+	struct list_head *pos, *n;
 
 	// dcu->hash_tags & dcu->hash_types are on cu->obstack
+	list_for_each_safe(pos, n, &cu->unspecified_types)
+		unspecified_type__delete(cu, container_of(pos, struct unspecified_type, node));
 	cu__free(cu, dcu);
 	cu->priv = NULL;
 }
@@ -1386,6 +1391,33 @@ static struct tag *die__create_new_tag(Dwarf_Die *die, struct cu *cu)
 	return tag;
 }
 
+static struct tag *die__create_new_unspecified_type(Dwarf_Die *die, struct cu *cu,
+						    struct conf_load *conf)
+{
+	struct unspecified_type *tag;
+
+	tag = tag__alloc_with_spec(cu, sizeof(struct unspecified_type));
+	if (tag == NULL)
+		return NULL;
+
+	tag__init(&tag->tag, cu, die);
+	INIT_LIST_HEAD(&tag->node);
+
+	tag->name = attr_string(die, DW_AT_name, conf);
+
+	list_add(&tag->node, &cu->unspecified_types);
+
+	return &tag->tag;
+}
+
+static void unspecified_type__delete(struct cu *cu, struct unspecified_type *utype)
+{
+	struct dwarf_tag *dtag = utype->tag.priv;
+
+	cu__free(cu, dtag);
+	cu__free(cu, utype);
+}
+
 static struct btf_type_tag_ptr_type *die__create_new_btf_type_tag_ptr_type(Dwarf_Die *die, struct cu *cu)
 {
 	struct btf_type_tag_ptr_type *tag;
@@ -2186,10 +2218,10 @@ static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 	case DW_TAG_volatile_type:
 	case DW_TAG_atomic_type:
 		tag = die__create_new_tag(die, cu);		break;
-	case DW_TAG_unspecified_type:
-		tag = die__create_new_tag(die, cu);		break;
 	case DW_TAG_pointer_type:
 		tag = die__create_new_pointer_tag(die, cu, conf);	break;
+	case DW_TAG_unspecified_type:
+		tag = die__create_new_unspecified_type(die, cu, conf); break;
 	case DW_TAG_ptr_to_member_type:
 		tag = die__create_new_ptr_to_member_type(die, cu); break;
 	case DW_TAG_enumeration_type:

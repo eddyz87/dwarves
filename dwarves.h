@@ -265,6 +265,7 @@ struct cu {
 	struct list_head node;
 	struct list_head tags;
 	struct list_head tool_list;	/* To be used by tools such as ctracer */
+	struct list_head unspecified_types;
 	struct ptr_table types_table;
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
@@ -703,6 +704,22 @@ static inline struct btf_type_tag_ptr_type *tag__btf_type_tag_ptr(struct tag *ta
 static inline struct btf_type_tag_type *tag__btf_type_tag(struct tag *tag)
 {
 	return (struct btf_type_tag_type *)tag;
+}
+
+/** struct unspecified_type - representation of DW_TAG_unspecified_type.
+ *
+ *  @name   - DW_AT_name associated with this tag
+ *  @node   - a node for cu::unspecified_types list
+ */
+struct unspecified_type {
+	struct tag		tag;
+	const char		*name;
+	struct list_head	node;
+};
+
+static inline struct unspecified_type *tag__unspecified_type(struct tag *tag)
+{
+	return (struct unspecified_type *)tag;
 }
 
 /** struct namespace - base class for enums, structs, unions, typedefs, etc
