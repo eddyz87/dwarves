@@ -419,8 +419,8 @@ int cu__for_all_tags(struct cu *cu,
 		     void *cookie);
 
 /** struct tag - basic representation of a debug info element
- * @priv - extra data, for instance, DWARF offset, id, decl_{file,line}
- * @top_level -
+ * @priv   - extra data, for instance, DWARF offset, id, decl_{file,line}
+ * @annots - list of btf_type_tag and btf_decl_tag annotations.
  */
 struct tag {
 	struct list_head node;
@@ -428,8 +428,8 @@ struct tag {
 	uint16_t	 tag;
 	bool		 visited;
 	bool		 top_level;
-	bool		 has_btf_type_tag;
 	uint16_t	 recursivity_level;
+	struct list_head annots;
 	void		 *priv;
 };
 
@@ -625,43 +625,31 @@ static inline struct ptr_to_member_type *
 	return (struct ptr_to_member_type *)tag;
 }
 
+enum annotation_kind {
+	BTF_DECL_TAG,
+	/* "btf_type_tag" in DWARF, attached to a pointer, applies to pointee type */
+	BTF_TYPE_TAG_POINTEE,
+};
+
+/** struct llvm_annotation - representing objects with DW_TAG_LLVM_annotation tag
+ *
+ * @tag           - DW_TAG_LLVM_annotation tag
+ * @kind          - annotation kind
+ * @value         - value string, valid for both "btf_decl_tag" and "btf_type_tag"
+ * @component_idx - component index, valid only for "btf_decl_tag"
+ * @node          - list_head node
+ */
 struct llvm_annotation {
+	struct tag		tag;
+	enum annotation_kind	kind;
 	const char		*value;
 	int16_t			component_idx;
 	struct list_head	node;
 };
 
-/** struct btf_type_tag_type - representing a btf_type_tag annotation
- *
- * @tag   - DW_TAG_LLVM_annotation tag
- * @value - btf_type_tag value string
- * @node  - list_head node
- */
-struct btf_type_tag_type {
-	struct tag		tag;
-	const char		*value;
-	struct list_head	node;
-};
-
-/** The struct btf_type_tag_ptr_type - type containing both pointer type and
- *  its btf_type_tag annotations
- *
- * @tag  - pointer type tag
- * @tags - btf_type_tag annotations for the pointer type
- */
-struct btf_type_tag_ptr_type {
-	struct tag		tag;
-	struct list_head 	tags;
-};
-
-static inline struct btf_type_tag_ptr_type *tag__btf_type_tag_ptr(struct tag *tag)
+static inline struct llvm_annotation *tag__llvm_annotation(struct tag *tag)
 {
-	return (struct btf_type_tag_ptr_type *)tag;
-}
-
-static inline struct btf_type_tag_type *tag__btf_type_tag(struct tag *tag)
-{
-	return (struct btf_type_tag_type *)tag;
+	return (struct llvm_annotation *)tag;
 }
 
 /** struct namespace - base class for enums, structs, unions, typedefs, etc
@@ -675,7 +663,6 @@ struct namespace {
 	uint16_t	 nr_tags;
 	uint8_t		 shared_tags;
 	struct list_head tags;
-	struct list_head annots;
 };
 
 static inline struct namespace *tag__namespace(const struct tag *tag)

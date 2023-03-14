@@ -112,6 +112,17 @@ static dwarf_off_ref dwarf_tag__spec(struct dwarf_tag *dtag)
 	return *(dwarf_off_ref *)(dtag + 1);
 }
 
+#define cu__tag_not_handled(die) __cu__tag_not_handled(die, __FUNCTION__)
+
+static void __cu__tag_not_handled(Dwarf_Die *die, const char *fn)
+{
+	uint32_t tag = dwarf_tag(die);
+
+	fprintf(stderr, "%s: DW_TAG_%s (%#x) @ <%#llx> not handled!\n",
+		fn, dwarf_tag_name(tag), tag,
+		(unsigned long long)dwarf_dieoffset(die));
+}
+
 static void dwarf_tag__set_spec(struct dwarf_tag *dtag, dwarf_off_ref spec)
 {
 	*(dwarf_off_ref *)(dtag + 1) = spec;
@@ -519,6 +530,7 @@ static void tag__init(struct tag *tag, struct cu *cu, Dwarf_Die *die)
 	}
 
 	INIT_LIST_HEAD(&tag->node);
+	INIT_LIST_HEAD(&tag->annots);
 }
 
 static struct tag *tag__new(Dwarf_Die *die, struct cu *cu)
@@ -608,7 +620,6 @@ static void namespace__init(struct namespace *namespace, Dwarf_Die *die,
 {
 	tag__init(&namespace->tag, cu, die);
 	INIT_LIST_HEAD(&namespace->tags);
-	INIT_LIST_HEAD(&namespace->annots);
 	namespace->name  = attr_string(die, DW_AT_name, conf);
 	namespace->nr_tags = 0;
 	namespace->shared_tags = 0;
@@ -876,8 +887,40 @@ static int tag__recode_dwarf_bitfield(struct tag *tag, struct cu *cu, uint16_t b
 	return -ENOMEM;
 }
 
-static int add_llvm_annotation(Dwarf_Die *die, int component_idx, struct conf_load *conf,
-			       struct list_head *head)
+static struct llvm_annotation *die__create_new_llvm_annotation(Dwarf_Die *die,
+							       struct cu *cu,
+							       struct conf_load *conf)
+{
+	struct llvm_annotation *tag;
+
+	tag = tag__alloc_with_spec(cu, sizeof(struct llvm_annotation));
+	if (tag == NULL)
+		return NULL;
+
+	tag__init(&tag->tag, cu, die);
+	return tag;
+}
+
+/** Allocate small_id for specified @tag */
+static int cu__assign_tag_id(struct cu *cu, struct tag *tag)
+{
+	struct dwarf_tag *dtag = tag->priv;
+	uint32_t id;
+
+	if (cu__table_add_tag(cu, tag, &id) < 0)
+		return -ENOMEM;
+
+	dtag->small_id = id;
+	cu__hash(cu, tag);
+
+	return 0;
+}
+
+static int add_btf_decl_tag(Dwarf_Die *die,
+			    struct cu *cu,
+			    int component_idx,
+			    struct conf_load *conf,
+			    struct list_head *head)
 {
 	struct llvm_annotation *annot;
 	const char *name;
@@ -890,17 +933,57 @@ static int add_llvm_annotation(Dwarf_Die *die, int component_idx, struct conf_lo
 	if (strcmp(name, "btf_decl_tag") != 0)
 		return 0;
 
-	annot = zalloc(sizeof(*annot));
+	annot = die__create_new_llvm_annotation(die, cu, conf);
 	if (!annot)
 		return -ENOMEM;
 
+	/* Don't assign id for btf_decl_tag */
+
+	annot->kind = BTF_DECL_TAG;
 	annot->value = attr_string(die, DW_AT_const_value, conf);
 	annot->component_idx = component_idx;
 	list_add_tail(&annot->node, head);
 	return 0;
 }
 
-static int add_child_llvm_annotations(Dwarf_Die *die, int component_idx,
+static int add_btf_type_tag(Dwarf_Die *die,
+			    struct cu *cu,
+			    struct conf_load *conf,
+			    struct list_head *head)
+{
+	struct llvm_annotation *annot;
+	const char *name;
+
+	if (conf->skip_encoding_btf_type_tag)
+		return 0;
+
+	name = attr_string(die, DW_AT_name, conf);
+
+	if (strcmp(name, "btf_type_tag") != 0)
+		return 0;
+
+	/* Create a btf_type_tag type for this annotation. */
+	annot = die__create_new_llvm_annotation(die, cu, conf);
+	if (annot == NULL)
+		return -ENOMEM;
+
+	cu__assign_tag_id(cu, &annot->tag);
+
+	annot->kind = BTF_TYPE_TAG_POINTEE;
+	annot->value = attr_string(die, DW_AT_const_value, conf);
+	annot->component_idx = -1;
+
+	/* For a list of DW_TAG_LLVM_annotation like tag1 -> tag2 -> tag3,
+	 * the tag->tags contains tag3 -> tag2 -> tag1.
+	 */
+	list_add(&annot->node, head);
+
+	return 0;
+}
+
+static int add_child_llvm_annotations(Dwarf_Die *die,
+				      struct cu *cu,
+				      int component_idx,
 				      struct conf_load *conf, struct list_head *head)
 {
 	Dwarf_Die child;
@@ -912,9 +995,14 @@ static int add_child_llvm_annotations(Dwarf_Die *die, int component_idx,
 	die = &child;
 	do {
 		if (dwarf_tag(die) == DW_TAG_LLVM_annotation) {
-			ret = add_llvm_annotation(die, component_idx, conf, head);
+			ret = add_btf_decl_tag(die, cu, component_idx, conf, head);
 			if (ret)
 				return ret;
+			ret = add_btf_type_tag(die, cu, conf, head);
+			if (ret)
+				return ret;
+		} else {
+			cu__tag_not_handled(die);
 		}
 	} while (dwarf_siblingof(die, die) == 0);
 
@@ -1340,18 +1428,7 @@ static uint64_t attr_upper_bound(Dwarf_Die *die)
 	return 0;
 }
 
-static void __cu__tag_not_handled(Dwarf_Die *die, const char *fn)
-{
-	uint32_t tag = dwarf_tag(die);
-
-	fprintf(stderr, "%s: DW_TAG_%s (%#x) @ <%#llx> not handled!\n",
-		fn, dwarf_tag_name(tag), tag,
-		(unsigned long long)dwarf_dieoffset(die));
-}
-
 static struct tag unsupported_tag;
-
-#define cu__tag_not_handled(die) __cu__tag_not_handled(die, __FUNCTION__)
 
 static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 				      int toplevel, const char *fn, struct conf_load *conf);
@@ -1372,87 +1449,15 @@ static struct tag *die__create_new_tag(Dwarf_Die *die, struct cu *cu)
 	return tag;
 }
 
-static struct btf_type_tag_ptr_type *die__create_new_btf_type_tag_ptr_type(Dwarf_Die *die, struct cu *cu)
+static struct tag *die__create_new_annotated_tag(Dwarf_Die *die, struct cu *cu,
+						 struct conf_load *conf)
 {
-	struct btf_type_tag_ptr_type *tag;
+	struct tag *tag = tag__new(die, cu);
 
-	tag  = tag__alloc_with_spec(cu, sizeof(struct btf_type_tag_ptr_type));
-	if (tag == NULL)
+	if (add_child_llvm_annotations(die, cu, -1, conf, &tag->annots))
 		return NULL;
 
-	tag__init(&tag->tag, cu, die);
-	tag->tag.has_btf_type_tag = true;
-	INIT_LIST_HEAD(&tag->tags);
 	return tag;
-}
-
-static struct btf_type_tag_type *die__create_new_btf_type_tag_type(Dwarf_Die *die, struct cu *cu,
-								   struct conf_load *conf)
-{
-	struct btf_type_tag_type *tag;
-
-	tag  = tag__alloc_with_spec(cu, sizeof(struct btf_type_tag_type));
-	if (tag == NULL)
-		return NULL;
-
-	tag__init(&tag->tag, cu, die);
-	tag->value = attr_string(die, DW_AT_const_value, conf);
-	return tag;
-}
-
-static struct tag *die__create_new_pointer_tag(Dwarf_Die *die, struct cu *cu,
-					       struct conf_load *conf)
-{
-	struct btf_type_tag_ptr_type *tag = NULL;
-	struct btf_type_tag_type *annot;
-	Dwarf_Die *cdie, child;
-	const char *name;
-	uint32_t id;
-
-	/* If no child tags or skipping btf_type_tag encoding, just create a new tag
-	 * and return
-	 */
-	if (!dwarf_haschildren(die) || dwarf_child(die, &child) != 0 ||
-	    conf->skip_encoding_btf_type_tag)
-		return tag__new(die, cu);
-
-	/* Otherwise, check DW_TAG_LLVM_annotation child tags */
-	cdie = &child;
-	do {
-		if (dwarf_tag(cdie) != DW_TAG_LLVM_annotation)
-			continue;
-
-		/* Only check btf_type_tag annotations */
-		name = attr_string(cdie, DW_AT_name, conf);
-		if (strcmp(name, "btf_type_tag") != 0)
-			continue;
-
-		if (tag == NULL) {
-			/* Create a btf_type_tag_ptr type. */
-			tag = die__create_new_btf_type_tag_ptr_type(die, cu);
-			if (!tag)
-				return NULL;
-		}
-
-		/* Create a btf_type_tag type for this annotation. */
-		annot = die__create_new_btf_type_tag_type(cdie, cu, conf);
-		if (annot == NULL)
-			return NULL;
-
-		if (cu__table_add_tag(cu, &annot->tag, &id) < 0)
-			return NULL;
-
-		struct dwarf_tag *dtag = annot->tag.priv;
-		dtag->small_id = id;
-		cu__hash(cu, &annot->tag);
-
-		/* For a list of DW_TAG_LLVM_annotation like tag1 -> tag2 -> tag3,
-		 * the tag->tags contains tag3 -> tag2 -> tag1.
-		 */
-		list_add(&annot->node, &tag->tags);
-	} while (dwarf_siblingof(cdie, cdie) == 0);
-
-	return tag ? &tag->tag : tag__new(die, cu);
 }
 
 static struct tag *die__create_new_ptr_to_member_type(Dwarf_Die *die,
@@ -1541,7 +1546,7 @@ static struct tag *die__create_new_typedef(Dwarf_Die *die, struct cu *cu, struct
 	if (tdef == NULL)
 		return NULL;
 
-	if (add_child_llvm_annotations(die, -1, conf, &tdef->namespace.annots))
+	if (add_child_llvm_annotations(die, cu, -1, conf, &tdef->namespace.tag.annots))
 		return NULL;
 
 	return &tdef->namespace.tag;
@@ -1610,7 +1615,8 @@ static struct tag *die__create_new_parameter(Dwarf_Die *die,
 	if (ftype != NULL) {
 		ftype__add_parameter(ftype, parm);
 		if (param_idx >= 0) {
-			if (add_child_llvm_annotations(die, param_idx, conf, &(tag__function(&ftype->tag)->annots)))
+			if (add_child_llvm_annotations(die, cu, param_idx, conf,
+						       &ftype->tag.annots))
 				return NULL;
 		}
 	} else {
@@ -1651,7 +1657,7 @@ static struct tag *die__create_new_variable(Dwarf_Die *die, struct cu *cu, struc
 {
 	struct variable *var = variable__new(die, cu, conf);
 
-	if (var == NULL || add_child_llvm_annotations(die, -1, conf, &var->annots))
+	if (var == NULL || add_child_llvm_annotations(die, cu, -1, conf, &var->annots))
 		return NULL;
 
 	return &var->ip.tag;
@@ -1806,13 +1812,16 @@ static int die__process_class(Dwarf_Die *die, struct type *class,
 
 			type__add_member(class, member);
 			cu__hash(cu, &member->tag);
-			if (add_child_llvm_annotations(die, member_idx, conf, &class->namespace.annots))
+			if (add_child_llvm_annotations(die, cu, member_idx, conf,
+						       &class->namespace.tag.annots))
 				return -ENOMEM;
 			member_idx++;
 		}
 			continue;
 		case DW_TAG_LLVM_annotation:
-			if (add_llvm_annotation(die, -1, conf, &class->namespace.annots))
+			if (add_btf_decl_tag(die, cu, -1, conf, &class->namespace.tag.annots))
+				return -ENOMEM;
+			if (add_btf_type_tag(die, cu, conf, &class->namespace.tag.annots))
 				return -ENOMEM;
 			continue;
 		default: {
@@ -2089,7 +2098,8 @@ static int die__process_function(Dwarf_Die *die, struct ftype *ftype,
 				goto out_enomem;
 			continue;
 		case DW_TAG_LLVM_annotation:
-			if (add_llvm_annotation(die, -1, conf, &(tag__function(&ftype->tag)->annots)))
+			if (add_btf_decl_tag(die, cu, -1, conf,
+					     &(tag__function(&ftype->tag)->annots)))
 				goto out_enomem;
 			continue;
 		default:
@@ -2165,7 +2175,7 @@ static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 	case DW_TAG_unspecified_type:
 		tag = die__create_new_tag(die, cu);		break;
 	case DW_TAG_pointer_type:
-		tag = die__create_new_pointer_tag(die, cu, conf);	break;
+		tag = die__create_new_annotated_tag(die, cu, conf); break;
 	case DW_TAG_ptr_to_member_type:
 		tag = die__create_new_ptr_to_member_type(die, cu); break;
 	case DW_TAG_enumeration_type:
@@ -2493,10 +2503,10 @@ static void lexblock__recode_dwarf_types(struct lexblock *tag, struct cu *cu)
 	}
 }
 
-static void dwarf_cu__recode_btf_type_tag_ptr(struct btf_type_tag_ptr_type *tag,
+static void dwarf_cu__recode_btf_type_tag_ptr(struct tag *tag,
 					      uint32_t pointee_type)
 {
-	struct btf_type_tag_type *annot;
+	struct llvm_annotation *annot;
 	struct dwarf_tag *annot_dtag;
 	struct tag *prev_tag;
 
@@ -2523,8 +2533,8 @@ static void dwarf_cu__recode_btf_type_tag_ptr(struct btf_type_tag_ptr_type *tag,
 	 *   int tag1 tag2 tag3 *p;
 	 * and this matches the user/kernel code.
 	 */
-	prev_tag = &tag->tag;
-	list_for_each_entry(annot, &tag->tags, node) {
+	prev_tag = tag;
+	list_for_each_entry(annot, &tag->annots, node) {
 		annot_dtag = annot->tag.priv;
 		prev_tag->type = annot_dtag->small_id;
 		prev_tag = &annot->tag;
@@ -2636,15 +2646,17 @@ static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 					var->spec = tag__variable(dtype->tag);
 			}
 		}
+		break;
 	}
-
+	case DW_TAG_LLVM_annotation:
+		return 0;
 	}
 
 	if (dtag->type.off == 0) {
-		if (tag->tag != DW_TAG_pointer_type || !tag->has_btf_type_tag)
+		if (tag->tag != DW_TAG_pointer_type)
 			tag->type = 0; /* void */
 		else
-			dwarf_cu__recode_btf_type_tag_ptr(tag__btf_type_tag_ptr(tag), 0);
+			dwarf_cu__recode_btf_type_tag_ptr(tag, 0);
 		return 0;
 	}
 
@@ -2656,10 +2668,10 @@ check_type:
 		return 0;
 	}
 out:
-	if (tag->tag != DW_TAG_pointer_type || !tag->has_btf_type_tag)
+	if (tag->tag != DW_TAG_pointer_type)
 		tag->type = dtype->small_id;
 	else
-		dwarf_cu__recode_btf_type_tag_ptr(tag__btf_type_tag_ptr(tag), dtype->small_id);
+		dwarf_cu__recode_btf_type_tag_ptr(tag, dtype->small_id);
 
 	return 0;
 }

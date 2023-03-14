@@ -893,6 +893,9 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder, struct functio
 		return -1;
 	}
 	list_for_each_entry(annot, &fn->annots, node) {
+		if (annot->kind != BTF_DECL_TAG)
+			continue;
+
 		tag_type_id = btf_encoder__add_decl_tag(encoder, annot->value, btf_fn_id,
 							annot->component_idx);
 		if (tag_type_id < 0) {
@@ -1175,7 +1178,7 @@ static int btf_encoder__encode_tag(struct btf_encoder *encoder, struct tag *tag,
 		name = namespace__name(tag__namespace(tag));
 		return btf_encoder__add_ref_type(encoder, BTF_KIND_TYPEDEF, ref_type_id, name, false);
 	case DW_TAG_LLVM_annotation:
-		name = tag__btf_type_tag(tag)->value;
+		name = tag__llvm_annotation(tag)->value;
 		return btf_encoder__add_ref_type(encoder, BTF_KIND_TYPE_TAG, ref_type_id, name, false);
 	case DW_TAG_structure_type:
 	case DW_TAG_union_type:
@@ -1600,6 +1603,9 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder)
 		}
 
 		list_for_each_entry(annot, &var->annots, node) {
+			if (annot->kind != BTF_DECL_TAG)
+				continue;
+
 			int tag_type_id = btf_encoder__add_decl_tag(encoder, annot->value, id, annot->component_idx);
 			if (tag_type_id < 0) {
 				fprintf(stderr, "error: failed to encode tag '%s' to variable '%s' with component_idx %d\n",
@@ -1793,7 +1799,10 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 
 		btf_type_id = encoder->type_id_off + core_id;
 		ns = tag__namespace(pos);
-		list_for_each_entry(annot, &ns->annots, node) {
+		list_for_each_entry(annot, &ns->tag.annots, node) {
+			if (annot->kind != BTF_DECL_TAG)
+				continue;
+
 			tag_type_id = btf_encoder__add_decl_tag(encoder, annot->value, btf_type_id, annot->component_idx);
 			if (tag_type_id < 0) {
 				fprintf(stderr, "error: failed to encode tag '%s' to %s '%s' with component_idx %d\n",
