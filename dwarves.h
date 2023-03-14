@@ -261,6 +261,10 @@ struct cu {
 	uint8_t		 has_addr_info:1;
 	uint8_t		 uses_global_strings:1;
 	uint8_t		 little_endian:1;
+	/* When set means that "btf:type_tags" annotations are present
+	 * and "btf_type_tags" annotations should be ignored during export.
+	 */
+	uint8_t		 ignore_btf_type_tag_pointee:1;
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	uint16_t	 language;
@@ -628,8 +632,12 @@ static inline struct ptr_to_member_type *
 
 enum annotation_kind {
 	BTF_DECL_TAG,
-	/* "btf_type_tag" in DWARF, attached to a pointer, applies to pointee type */
+	/* "btf_type_tag" in DWARF, attached to a pointer, applies to pointee type.
+	 * Old-style encoding kept for backwards compatibility.
+	 */
 	BTF_TYPE_TAG_POINTEE,
+	/* "btf:type_tag" in DWARF, attached to any type, applies to parent type */
+	BTF_TYPE_TAG,
 };
 
 /** struct llvm_annotation - representing objects with DW_TAG_LLVM_annotation tag
