@@ -465,7 +465,6 @@ struct tag {
 	uint16_t	 tag;
 	bool		 visited;
 	bool		 top_level;
-	bool		 has_btf_type_tag;
 	uint16_t	 recursivity_level;
 	void		 *priv;
 };
@@ -677,29 +676,11 @@ struct llvm_annotation {
  *
  * @tag   - DW_TAG_LLVM_annotation tag
  * @value - btf_type_tag value string
- * @node  - list_head node
  */
 struct btf_type_tag_type {
 	struct tag		tag;
 	const char		*value;
-	struct list_head	node;
 };
-
-/** The struct btf_type_tag_ptr_type - type containing both pointer type and
- *  its btf_type_tag annotations
- *
- * @tag  - pointer type tag
- * @tags - btf_type_tag annotations for the pointer type
- */
-struct btf_type_tag_ptr_type {
-	struct tag		tag;
-	struct list_head 	tags;
-};
-
-static inline struct btf_type_tag_ptr_type *tag__btf_type_tag_ptr(struct tag *tag)
-{
-	return (struct btf_type_tag_ptr_type *)tag;
-}
 
 static inline struct btf_type_tag_type *tag__btf_type_tag(struct tag *tag)
 {
