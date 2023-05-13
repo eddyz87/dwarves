@@ -204,6 +204,10 @@ struct ptr_table {
 	uint32_t allocated_entries;
 };
 
+void ptr_table__init(struct ptr_table *pt);
+void ptr_table__exit(struct ptr_table *pt);
+int ptr_table__add(struct ptr_table *pt, void *ptr, uint32_t *idxp);
+
 struct function;
 struct tag;
 struct cu;

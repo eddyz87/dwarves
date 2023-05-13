@@ -491,18 +491,18 @@ void cus__add(struct cus *cus, struct cu *cu)
 	cu__find_class_holes(cu);
 }
 
-static void ptr_table__init(struct ptr_table *pt)
+void ptr_table__init(struct ptr_table *pt)
 {
 	pt->entries = NULL;
 	pt->nr_entries = pt->allocated_entries = 0;
 }
 
-static void ptr_table__exit(struct ptr_table *pt)
+void ptr_table__exit(struct ptr_table *pt)
 {
 	zfree(&pt->entries);
 }
 
-static int ptr_table__add(struct ptr_table *pt, void *ptr, uint32_t *idxp)
+int ptr_table__add(struct ptr_table *pt, void *ptr, uint32_t *idxp)
 {
 	const uint32_t nr_entries = pt->nr_entries + 1;
 	const uint32_t rc = pt->nr_entries;
