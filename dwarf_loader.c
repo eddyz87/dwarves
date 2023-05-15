@@ -3134,12 +3134,222 @@ static int die__process(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 	return 0;
 }
 
+/* LISP-style single-linked immutable list */
+struct string_list {
+	const char *string;
+	const struct string_list *next;
+};
+
+enum {
+	CONST = 1u << 1,
+	VOLATILE = 1u << 2,
+	RESTRICT = 1u << 3,
+};
+
+/* Create a type corresponding to @target_id wrapped in CVR qualifiers
+ * specified in @cvr.
+ *
+ * @target_id -  in: ID of a type to wrap with qualifiers
+ *              out: ID of the resulting qualified type.
+ */
+static int wrap_qualifiers(struct cu *cu, uint32_t cvr, uint32_t *target_id)
+{
+	struct {
+		uint16_t code;
+		bool present;
+	} qualifiers[3] = {
+		{ DW_TAG_restrict_type, cvr & RESTRICT },
+		{ DW_TAG_volatile_type, cvr & VOLATILE },
+		{ DW_TAG_const_type   , cvr & CONST },
+	};
+
+	for (uint32_t i = 0; i < 3; ++i) {
+		struct tag *tag;
+
+		if (!qualifiers[i].present)
+			continue;
+
+		tag = tag__alloc(cu, sizeof(*tag));
+		if (tag == NULL)
+			return -ENOMEM;
+
+		tag__init_dummy(tag, cu, qualifiers[i].code);
+		tag->type = *target_id;
+		if (cu__add_tag(cu, tag, target_id))
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
+/* Wrap @target_id with type tags specified by @tags, assign the
+ * @top_id as ID of the resulting type.
+ */
+static int wrap_type_tags(struct cu *cu, uint32_t top_id, uint32_t target_id,
+			  const struct string_list *tags)
+{
+	struct btf_type_tag_type *type_tag;
+	uint32_t running_id = target_id;
+	int ret = 0;
+
+	for (; tags != NULL; tags = tags->next) {
+		type_tag = new_btf_type_tag_type(cu, tags->string);
+		if (type_tag == NULL)
+			return -ENOMEM;
+
+		type_tag->tag.type = running_id;
+		if (tags->next != NULL) {
+			ret = cu__add_tag(cu, &type_tag->tag, &running_id);
+		} else {
+			struct tag *top_tag = cu__type(cu, top_id);
+
+			list_del_init(&top_tag->node);
+			cu__table_nullify_type_entry(cu, top_id);
+			cu__free(cu, top_tag);
+			ret = cu__add_tag_with_id(cu, &type_tag->tag, top_id);
+			break;
+		}
+	}
+
+	return ret;
+}
+
+/* Traverse CVR/type tag chain starting from @top_id and replace it
+ * with a chain starting from type tags.
+ *
+ * @top_id - first ID in the CVR/type tag chain, type entry
+ *           corresponding to this ID would be replaced.
+ * @id     - current ID in the CVR/type tag chain, used for recursive descend.
+ * @cvr    - CVR bits accumulated so far.
+ * @tags   - list of type tags accumulated so far.
+ */
+static int rebuild_type_tag_chain(struct cu *cu, uint32_t top_id, uint32_t id, uint32_t cvr,
+				  struct string_list *tags)
+{
+	struct string_list tag_node = {};
+	uint32_t qualified_id;
+	uint16_t dw_tag = 0;
+	struct tag *tag;
+	int ret;
+
+	tag = cu__type(cu, id);
+	if (tag != NULL)
+		dw_tag = tag->tag;
+
+	switch (dw_tag) {
+	case DW_TAG_const_type:
+		cvr |= CONST;
+		break;
+	case DW_TAG_volatile_type:
+		cvr |= VOLATILE;
+		break;
+	case DW_TAG_restrict_type:
+		cvr |= RESTRICT;
+		break;
+	case DW_TAG_LLVM_annotation:
+		tag_node.string = tag__btf_type_tag(tag)->value;
+		tag_node.next = tags;
+		tags = &tag_node;
+		break;
+	default:
+		if (cvr == 0 || tags == NULL)
+			return 0;
+
+		qualified_id = id;
+		ret = wrap_qualifiers(cu, cvr, &qualified_id);
+		if (ret)
+			return ret;
+		return wrap_type_tags(cu, top_id, qualified_id, tags);
+	}
+
+	return rebuild_type_tag_chain(cu, top_id, tag->type, cvr, tags);
+}
+
+/* After some discussion in [1] it was agreed to attach type tag
+ * annotations of TYPE_TAG_SELF kind only to "base" types,
+ * specifically to:
+ * - base types;
+ * - arrays;
+ * - pointers;
+ * - structs
+ * - unions;
+ * - enums;
+ * - typedefs.
+ *
+ * And to not attach such tags to const/volatile/restrict derived types.
+ * However, current Linux Kernel BTF validation code expects that all
+ * type tags precede CVR qualifiers.
+ *
+ * In other words, CLANG and GCC would generate tag chains like this:
+ *
+ *   const -> volatile -> tag1 -> int
+ *
+ * But kernel wants tag chain to be:
+ *
+ *   tag1 -> const -> volatile -> int
+ *
+ * The code below moves type tags before CVR qualifiers in following steps
+ * for each CVR-type:
+ * - recursively traverse CVR / TYPE_TAG chain, accumulating CVR bits
+ *   and type tags
+ * - rebuild the chain with type tags put at front
+ * - for the first entry in a chain replace original CVR type entry
+ *   with type tag entry, so that all links to this type remain valid
+ *
+ * For example, the following chain:
+ *
+ *   const -> volatile -> tag1 -> int
+ *   id: 1    id: 2       id: 3   id: 4
+ *
+ * Would be rewritten as:
+ *
+ *   tag1 -> const -> volatile -> int
+ *   id: 1   id: 5    id: 6       id: 4
+ *                                 ^
+ *   tag1 -> volatile -------------|
+ *   id: 2   id: 7                 |
+ *                                 |
+ *   tag1 -------------------------'
+ *   id: 3
+ *
+ * The unnecessary duplicate chains 6->4 and 7->4 would be removed by
+ * libbpf's BTF deduplication algorithm.
+ *
+ * [1] https://reviews.llvm.org/D143967
+ */
+static int move_type_tags_before_cvr_qualifiers(struct cu *cu)
+{
+	uint32_t N = cu->types_table.nr_entries;
+	struct tag *tag;
+	int ret = 0;
+
+	for (uint32_t id = 1; id < N; ++id) {
+		tag = cu__type(cu, id);
+		if (tag == NULL)
+			continue;
+
+		if (tag->tag != DW_TAG_const_type &&
+		    tag->tag != DW_TAG_volatile_type &&
+		    tag->tag != DW_TAG_restrict_type)
+			continue;
+
+		ret = rebuild_type_tag_chain(cu, id, id, 0, NULL);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int die__process_and_recode(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	int ret = die__process(die, cu, conf);
 	if (ret != 0)
 		return ret;
 	ret = cu__recode_dwarf_types(cu);
+	if (ret != 0)
+		return ret;
+	ret = move_type_tags_before_cvr_qualifiers(cu);
 	if (ret != 0)
 		return ret;
 
