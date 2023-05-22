@@ -1498,6 +1498,19 @@ static bool ftype__has_arg_names(const struct ftype *ftype)
 	return true;
 }
 
+static type_id_t skip_btf_type_tags(struct cu *cu, type_id_t id)
+{
+	for (;;) {
+		struct tag *tag = cu__type(cu, id);
+
+		if (tag == NULL || tag->tag != DW_TAG_LLVM_annotation)
+			break;
+		id = tag->type;
+	}
+
+	return id;
+}
+
 static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder)
 {
 	struct cu *cu = encoder->cu;
@@ -1583,7 +1596,22 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder)
 			continue;
 		}
 
-		type = var->ip.tag.type + encoder->type_id_off;
+		/* Kernel does not expect VAR entries to have types starting from BTF_TYPE_TAG.
+		 * Specifically, the code like below will be rejected:
+		 *
+		 *   struct rq __percpu runqueues;
+		 *   ...
+		 *   rq = (struct rq *)bpf_per_cpu_ptr(&runqueues, cpu);
+		 *   ... rq->cpu ...     // rq type is now PTR_TO_BTF_ID
+		 *
+		 * The access to 'rq->cpu' would be checked by a call to
+		 * kernel/bpf/btf.c:btf_struct_access() which invokes btf_struct_walk(),
+		 * using rq's type as a starting point. The btf_struct_walk() wants the
+		 * first type in a chain to be STRUCT or UNION and does not skip modifiers.
+		 *
+		 * Thus, call skip_btf_type_tags() here.
+		 */
+		type = skip_btf_type_tags(cu, var->ip.tag.type) + encoder->type_id_off;
 		linkage = var->external ? BTF_VAR_GLOBAL_ALLOCATED : BTF_VAR_STATIC;
 
 		if (encoder->verbose) {
