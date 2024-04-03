@@ -1362,7 +1362,8 @@ out:
 	return err;
 }
 
-int btf_encoder__encode(struct btf_encoder *encoder)
+int btf_encoder__encode(struct btf_encoder *encoder,
+			struct conf_load *conf_load)
 {
 	int err;
 
@@ -1378,6 +1379,12 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 
 	if (btf__dedup(encoder->btf, NULL)) {
 		fprintf(stderr, "%s: btf__dedup failed!\n", __func__);
+		return -1;
+	}
+
+	if (conf_load->reproducible_build &&
+	    btf_encoder__sort(encoder, conf_load) < 0) {
+		fprintf(stderr, "%s: btf_encoder__sort failed!\n", __func__);
 		return -1;
 	}
 
@@ -1908,4 +1915,355 @@ out:
 struct btf *btf_encoder__btf(struct btf_encoder *encoder)
 {
 	return encoder->btf;
+}
+
+struct compare_ctx {
+	struct btf *btf;
+	int compare_struct_member_types;
+};
+
+/* Ordering function for BTF types, orders types by:
+ * - kind, kflag, vlen, name;
+ * - type, offset, name properties of members.
+ */
+static int compare_btf_ids(int a, int b, void *ctx_raw)
+{
+	struct compare_ctx *ctx = ctx_raw;
+	struct compare_ctx nested_ctx = {
+		.btf = ctx->btf,
+		/* Avoid deep recursive calls to `compare_btf_ids`
+		 * when comparing STRUCT / UNION members.
+		 */
+		.compare_struct_member_types = 0,
+	};
+	struct btf *btf = ctx->btf;
+	const struct btf_type *ta = btf__type_by_id(btf, a);
+	const struct btf_type *tb = btf__type_by_id(btf, b);
+	int diff, i;
+
+	if ((diff = (int)btf_kind(ta)  - btf_kind(tb))  ||
+	    (diff = (int)btf_kflag(ta) - btf_kflag(tb)) ||
+	    (diff = (int)btf_vlen(ta)  - btf_vlen(tb))  ||
+	    (diff = strcmp(btf__str_by_offset(btf, ta->name_off),
+			   btf__str_by_offset(btf, tb->name_off))))
+		return diff;
+
+	switch (btf_kind(ta)) {
+	case BTF_KIND_STRUCT:
+	case BTF_KIND_UNION:
+		for (i = 0; i < btf_vlen(ta); ++i) {
+			struct btf_member *ma = &btf_members(ta)[i];
+			struct btf_member *mb = &btf_members(tb)[i];
+
+			if ((diff = (int)ma->offset - mb->offset) ||
+			    (diff = strcmp(btf__str_by_offset(btf, ma->name_off),
+					   btf__str_by_offset(btf, mb->name_off))))
+				return diff;
+		}
+		if (!ctx->compare_struct_member_types)
+			break;
+		for (i = 0; i < btf_vlen(ta); ++i) {
+			struct btf_member *ma = &btf_members(ta)[i];
+			struct btf_member *mb = &btf_members(tb)[i];
+
+			if ((diff = compare_btf_ids(ma->type, mb->type, &nested_ctx)))
+				return diff;
+		}
+		break;
+	case BTF_KIND_ENUM:
+		for (i = 0; i < btf_vlen(ta); ++i) {
+			struct btf_enum *ma = &btf_enum(ta)[i];
+			struct btf_enum *mb = &btf_enum(tb)[i];
+
+			if ((diff = (int)ma->val - mb->val) ||
+			    (diff = strcmp(btf__str_by_offset(btf, ma->name_off),
+					   btf__str_by_offset(btf, mb->name_off))))
+				return diff;
+		}
+		break;
+	case BTF_KIND_ENUM64:
+		for (i = 0; i < btf_vlen(ta); ++i) {
+			struct btf_enum64 *ma = &btf_enum64(ta)[i];
+			struct btf_enum64 *mb = &btf_enum64(tb)[i];
+
+			if ((diff = (int)ma->val_lo32 - mb->val_lo32) ||
+			    (diff = (int)ma->val_hi32 - mb->val_hi32) ||
+			    (diff = strcmp(btf__str_by_offset(btf, ma->name_off),
+					   btf__str_by_offset(btf, mb->name_off))))
+				return diff;
+		}
+		break;
+	case BTF_KIND_FUNC_PROTO:
+		if ((diff = compare_btf_ids(ta->type, tb->type, &nested_ctx)))
+			return diff;
+		for (i = 0; i < btf_vlen(ta); ++i) {
+			struct btf_param *ma = &btf_params(ta)[i];
+			struct btf_param *mb = &btf_params(tb)[i];
+
+			if ((diff = strcmp(btf__str_by_offset(btf, ma->name_off),
+					   btf__str_by_offset(btf, mb->name_off))) ||
+			    (diff = compare_btf_ids(ma->type, mb->type, &nested_ctx)))
+				return diff;
+		}
+		break;
+	case BTF_KIND_ARRAY: {
+		struct btf_array *ma = btf_array(ta);
+		struct btf_array *mb = btf_array(tb);
+
+		if ((diff = (int)ma->nelems - (int)mb->nelems) ||
+		    (diff = compare_btf_ids(ma->type, mb->type, &nested_ctx)) ||
+		    (diff = compare_btf_ids(ma->index_type, mb->index_type, &nested_ctx)))
+			return diff;
+		break;
+	}
+	case BTF_KIND_INT:
+		if ((diff = (int)btf_int_encoding(ta) - (int)btf_int_encoding(tb)) ||
+		    (diff = (int)btf_int_offset(ta) - (int)btf_int_offset(tb)) ||
+		    (diff = (int)btf_int_bits(ta) - (int)btf_int_bits(tb)))
+			return diff;
+		break;
+	case BTF_KIND_PTR:
+	case BTF_KIND_CONST:
+	case BTF_KIND_VOLATILE:
+	case BTF_KIND_RESTRICT:
+	case BTF_KIND_TYPEDEF:
+	case BTF_KIND_FUNC:
+	case BTF_KIND_DECL_TAG:
+	case BTF_KIND_TYPE_TAG:
+		return compare_btf_ids(ta->type, tb->type, &nested_ctx);
+	case BTF_KIND_VAR: {
+		struct btf_var *ma = btf_var(ta);
+		struct btf_var *mb = btf_var(tb);
+
+		if ((diff = (int)ma->linkage - (int)mb->linkage) ||
+		    (diff = compare_btf_ids(ta->type, tb->type, &nested_ctx)))
+			return diff;
+		break;
+	}
+	case BTF_KIND_FLOAT:
+		if ((diff = (int)ta->size - tb->size))
+			return diff;
+		break;
+	}
+
+	return 0;
+}
+
+int psort(int *base, size_t nmemb, int (*compare)(int, int, void *), void *arg, size_t nr_jobs);
+
+/* Rebuild encoder->btf in a way that for each type ID there is a relation
+ * compare_btf_ids(ID, ID + 1, encoder->btf) <= 0.
+ */
+int btf_encoder__sort(struct btf_encoder *encoder, struct conf_load *conf)
+{
+	struct btf *old = encoder->btf;
+	const struct btf *base = btf__base_btf(old);
+	__u32 old_id, new_id, i, N = btf__type_cnt(old);
+	struct btf *new = NULL;
+	__u32 *new2old = NULL;
+	__u32 *old2new = NULL;
+	__u32 start_id = base ? btf__type_cnt(base) : 1;
+
+	new = btf__new_empty_split((struct btf *)base);
+	if (!new)
+		goto out_err;
+
+	new2old = malloc(sizeof(*new2old) * N);
+	old2new = malloc(sizeof(*old2new) * N);
+	if (!new2old || !old2new) {
+		fprintf(stderr, "%s: malloc failed\n", __FUNCTION__);
+		goto out_err;
+	}
+
+	for (old_id = 0; old_id < N; ++old_id)
+		new2old[old_id] = old_id;
+
+	struct compare_ctx compare_ctx = {
+		.btf = old,
+		.compare_struct_member_types = 1,
+	};
+	/* Sort new2old using `compare_btf_ids` relation.
+	 * Each call to `compare_btf_ids` is costly, so use multiple
+	 * threads for sorting.
+	 */
+	psort((int *)&new2old[start_id], N - start_id, compare_btf_ids, &compare_ctx, conf->nr_jobs);
+	for (new_id = 0; new_id < N; ++new_id)
+		old2new[new2old[new_id]] = new_id;
+
+	/* Rebuild the BTF ensuring types are added in order
+	 * determined by new2old and all type references are remapped.
+	 */
+	for (new_id = start_id; new_id < N; ++new_id) {
+		const struct btf_type *t;
+		int id, err, kind;
+		const char *name;
+
+		old_id = new2old[new_id];
+		t = btf__type_by_id(old, old_id);
+		name = btf__name_by_offset(old, t->name_off);
+		kind = btf_kind(t);
+
+		switch (kind) {
+		case BTF_KIND_INT:
+			id = btf__add_int(new, name, t->size, btf_int_encoding(t));
+			break;
+		case BTF_KIND_PTR:
+			id = btf__add_ptr(new, old2new[t->type]);
+			break;
+		case BTF_KIND_ARRAY: {
+			struct btf_array *m = btf_array(t);
+
+			id = btf__add_array(new, old2new[m->index_type], old2new[m->type], m->nelems);
+			break;
+		}
+		case BTF_KIND_STRUCT:
+		case BTF_KIND_UNION:
+		{
+			if (kind == BTF_KIND_STRUCT)
+				id = btf__add_struct(new, name, t->size);
+			else
+				id = btf__add_union(new, name, t->size);
+			if (id < 0)
+				goto out_err;
+			for (i = 0; i < btf_vlen(t); ++i) {
+				struct btf_member *m = &btf_members(t)[i];
+
+				err = btf__add_field(new, btf__name_by_offset(old, m->name_off),
+						     old2new[m->type],
+						     btf_member_bit_offset(t, i),
+						     btf_member_bitfield_size(t, i));
+				if (err < 0) {
+					fprintf(stderr, "%s: error adding field for ID %d\n",
+						__FUNCTION__, old_id);
+					goto out_err;
+				}
+			}
+			break;
+		}
+		case BTF_KIND_ENUM:
+			id = btf__add_enum(new, name, t->size);
+			if (id < 0)
+				goto out_err;
+			for (i = 0; i < btf_vlen(t); ++i) {
+				struct btf_enum *m = &btf_enum(t)[i];
+
+				err = btf__add_enum_value(new, btf__name_by_offset(old, m->name_off), m->val);
+				if (err) {
+					fprintf(stderr, "%s: error adding enum value for ID %d\n",
+						__FUNCTION__, old_id);
+					goto out_err;
+				}
+			}
+			break;
+		case BTF_KIND_ENUM64:
+			id = btf__add_enum64(new, name, t->size, btf_kflag(t));
+			if (id < 0)
+				goto out_err;
+			for (i = 0; i < btf_vlen(t); ++i) {
+				struct btf_enum64 *m = &btf_enum64(t)[i];
+
+				err = btf__add_enum64_value(new, btf__name_by_offset(old, m->name_off), btf_enum64_value(m));
+				if (err) {
+					fprintf(stderr, "%s: error adding enum64 value for ID %d\n",
+						__FUNCTION__, old_id);
+					goto out_err;
+				}
+			}
+			break;
+		case BTF_KIND_FWD:
+			id = btf__add_fwd(new, name, btf_kflag(t));
+			break;
+		case BTF_KIND_TYPEDEF:
+			id = btf__add_typedef(new, name, old2new[t->type]);
+			break;
+		case BTF_KIND_VOLATILE:
+			id = btf__add_volatile(new, old2new[t->type]);
+			break;
+		case BTF_KIND_CONST:
+			id = btf__add_const(new, old2new[t->type]);
+			break;
+		case BTF_KIND_RESTRICT:
+			id = btf__add_restrict(new, old2new[t->type]);
+			break;
+		case BTF_KIND_FUNC:
+			id = btf__add_func(new, name, btf_vlen(t), old2new[t->type]);
+			break;
+		case BTF_KIND_FUNC_PROTO:
+			id = btf__add_func_proto(new, old2new[t->type]);
+			if (id < 0)
+				goto out_err;
+			for (i = 0; i < btf_vlen(t); ++i) {
+				struct btf_param *m = &btf_params(t)[i];
+
+				err = btf__add_func_param(new, btf__name_by_offset(old, m->name_off), old2new[m->type]);
+				if (err) {
+					fprintf(stderr, "%s: error adding func param for ID %d\n",
+						__FUNCTION__, old_id);
+					goto out_err;
+				}
+			}
+			break;
+		case BTF_KIND_VAR: {
+			struct btf_var *m = btf_var(t);
+
+			id = btf__add_var(new, name, m->linkage, old2new[t->type]);
+			break;
+		}
+		case BTF_KIND_DATASEC: {
+			id = btf__add_datasec(new, name, t->size);
+			if (id < 0)
+				goto out_err;
+			for (i = 0; i < btf_vlen(t); ++i) {
+				struct btf_var_secinfo *m = &btf_var_secinfos(t)[i];
+
+				err = btf__add_datasec_var_info(new, old2new[m->type], m->offset, m->size);
+				if (err < 0) {
+					fprintf(stderr, "%s: error adding datasec_var_info for ID %d\n",
+						__FUNCTION__, old_id);
+					goto out_err;
+				}
+			}
+			break;
+			}
+		case BTF_KIND_FLOAT:
+			id = btf__add_float(new, name, t->size);
+			break;
+		case BTF_KIND_DECL_TAG: {
+			struct btf_decl_tag *m = btf_decl_tag(t);
+
+			id = btf__add_decl_tag(new, name, old2new[t->type], m->component_idx);
+			break;
+		}
+		case BTF_KIND_TYPE_TAG:
+			id = btf__add_type_tag(new, name, old2new[t->type]);
+			break;
+		default:
+			fprintf(stderr, "%s: unknown BTF kind %d for ID %d\n",
+				__FUNCTION__, kind, old_id);
+			goto out_err;
+		}
+
+		if (id < 0) {
+			fprintf(stderr, "%s: error creating a copy of ID %d\n",
+				__FUNCTION__, old_id);
+			goto out_err;
+		}
+		if (id != new_id) {
+			fprintf(stderr, "%s: allocated ID %d does not match expected ID %d for old ID %d\n",
+				__FUNCTION__, id, new_id, old_id);
+			goto out_err;
+		}
+	}
+
+	encoder->btf = new;
+	free(new2old);
+	free(old2new);
+	btf__free(old);
+	return 0;
+
+out_err:
+	free(new2old);
+	free(old2new);
+	btf__free(new);
+	return -1;
 }

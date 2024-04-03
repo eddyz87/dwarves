@@ -3778,7 +3778,7 @@ try_sole_arg_as_class_names:
 	header = NULL;
 
 	if (btf_encode && btf_encoder) { // maybe all CUs were filtered out and thus we don't have an encoder?
-		err = btf_encoder__encode(btf_encoder);
+		err = btf_encoder__encode(btf_encoder, &conf_load);
 		if (err) {
 			fputs("Failed to encode BTF\n", stderr);
 			goto out_cus_delete;
