@@ -1152,6 +1152,7 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARG_padding_ge		   347
 #define ARG_padding		   348
 #define ARGP_with_embedded_flexible_array 349
+#define ARGP_btf_attributes	   350
 
 /* --btf_features=feature1[,feature2,..] allows us to specify
  * a list of requested BTF features or "default" to enable all default
@@ -1210,6 +1211,9 @@ struct btf_feature {
 	BTF_NON_DEFAULT_FEATURE(distilled_base, btf_gen_distilled_base, false),
 #endif
 	BTF_NON_DEFAULT_FEATURE(global_var, encode_btf_global_vars, false),
+#if LIBBPF_MAJOR_VERSION >= 1 && LIBBPF_MINOR_VERSION >= 6
+	BTF_NON_DEFAULT_FEATURE(attributes, btf_attributes, false),
+#endif
 };
 
 #define BTF_MAX_FEATURE_STR	1024
@@ -1786,6 +1790,11 @@ static const struct argp_option pahole__options[] = {
 		.doc = "Search for, possibly getting from a debuginfo server, a vmlinux matching the running kernel build-id (from /sys/kernel/notes)"
 	},
 	{
+		.name = "btf_attributes",
+		.key  = ARGP_btf_attributes,
+		.doc  = "Allow generation of attributes in BTF. Attributes are the type tags and decl tags with the kind_flag set to 1.",
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -1979,6 +1988,8 @@ static error_t pahole__options_parser(int key, char *arg,
 		show_supported_btf_features(stdout);	exit(0);
 	case ARGP_btf_features_strict:
 		parse_btf_features(arg, true);		break;
+	case ARGP_btf_attributes:
+		conf_load.btf_attributes = true;	break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
