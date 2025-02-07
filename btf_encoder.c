@@ -40,7 +40,13 @@
 #define BTF_SET8_KFUNCS		(1 << 0)
 #define BTF_KFUNC_TYPE_TAG	"bpf_kfunc"
 #define BTF_FASTCALL_TAG       "bpf_fastcall"
-#define KF_FASTCALL            (1 << 12)
+#define BPF_ARENA_ATTR         "address_space(1)"
+
+/* kfunc flags, see include/linux/btf.h in the kernel source */
+#define KF_FASTCALL   (1 << 12)
+#define KF_ARENA_RET  (1 << 13)
+#define KF_ARENA_ARG1 (1 << 14)
+#define KF_ARENA_ARG2 (1 << 15)
 
 struct btf_id_and_flag {
 	uint32_t id;
@@ -1843,6 +1849,62 @@ static int btf__add_kfunc_decl_tag(struct btf *btf, const char *tag, __u32 id, c
 	return 0;
 }
 
+#if LIBBPF_MAJOR_VERSION >= 1 && LIBBPF_MINOR_VERSION >= 6
+static int add_tagged_ptr(struct btf *btf, int ptr_id, const char *attr)
+{
+	const struct btf_type *ptr;
+	int tagged_type_id;
+
+	ptr = btf__type_by_id(btf, ptr_id);
+	if (!btf_is_ptr(ptr)) {
+		// TODO: print kfunc name here
+		fprintf(stderr, "Can't tag non-pointer with attribute %s\n", attr);
+		return -EINVAL;
+	}
+
+	tagged_type_id = btf__add_type_attr(btf, attr, ptr->type);
+	if (tagged_type_id < 0)
+		return tagged_type_id;
+
+	return btf__add_ptr(btf, tagged_type_id);
+}
+
+static int btf__add_return_type_attr(struct btf *btf, __u32 func_id, const char *attr)
+{
+	struct btf_type *func, *proto;
+	int id;
+
+	func = (struct btf_type *)btf__type_by_id(btf, func_id);
+	proto = (struct btf_type *)btf__type_by_id(btf, func->type);
+	id = add_tagged_ptr(btf, proto->type, attr);
+	if (id < 0)
+		return id;
+	proto->type = id;
+	return 0;
+}
+
+static int btf__add_param_type_attr(struct btf *btf, __u32 func_id, __u32 param, const char *attr)
+{
+	struct btf_type *func, *proto;
+	struct btf_param *params;
+	int id;
+
+	func = (struct btf_type *)btf__type_by_id(btf, func_id);
+	proto = (struct btf_type *)btf__type_by_id(btf, func->type);
+	if (param >= btf_vlen(proto)) {
+		fprintf(stderr, "Invalid kfunc flags for function %s: argument #%d does not exist\n",
+			btf__name_by_offset(btf, func->name_off), param);
+		return -EINVAL;
+	}
+	params = btf_params(proto);
+	id = add_tagged_ptr(btf, params[param].type, attr);
+	if (id < 0)
+		return id;
+	params[param].type = id;
+	return 0;
+}
+#endif // LIBBPF_MAJOR_VERSION >= 1 && LIBBPF_MINOR_VERSION >= 6
+
 static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *funcs, const char *kfunc, __u32 flags)
 {
 	struct btf_func key = { .name = kfunc };
@@ -1873,6 +1935,25 @@ static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *
 		if (err < 0)
 			return err;
 	}
+#if LIBBPF_MAJOR_VERSION >= 1 && LIBBPF_MINOR_VERSION >= 6
+	if (encoder->encode_attributes) {
+		if (flags & KF_ARENA_RET) {
+			err = btf__add_return_type_attr(btf, target->type_id, BPF_ARENA_ATTR);
+			if (err < 0)
+				return err;
+		}
+		if (flags & KF_ARENA_ARG1) {
+			err = btf__add_param_type_attr(btf, target->type_id, 0, BPF_ARENA_ATTR);
+			if (err < 0)
+				return err;
+		}
+		if (flags & KF_ARENA_ARG2) {
+			err = btf__add_param_type_attr(btf, target->type_id, 1, BPF_ARENA_ATTR);
+			if (err < 0)
+				return err;
+		}
+	}
+#endif
 
 	return 0;
 }
